@@ -9,6 +9,10 @@ const path = require('path');
 const app = express();
 const port = 3001; // 使用3001端口
 
+// 创建图片服务器应用
+const imageApp = express();
+const imagePort = 3002; // 图片服务端口
+
 // 启动 Python 服务
 const pythonProcess = spawn('python', ['backend/app.py'], {
   stdio: 'inherit', // 让 Python 的输出显示在 Node 控制台
@@ -22,6 +26,20 @@ pythonProcess.on('close', (code) => {
 // 允许跨域请求
 app.use(cors());
 app.use(bodyParser.json());
+
+// 图片服务器跨域配置
+imageApp.use(cors());
+imageApp.use(bodyParser.json());
+imageApp.use(bodyParser.urlencoded({ extended: true }));
+
+// 配置静态文件服务（为用户图片提供HTTP访问）
+const userimagesPath = path.join(__dirname, 'backend', 'userimages');
+if (fs.existsSync(userimagesPath)) {
+  imageApp.use('/userimages', express.static(userimagesPath));
+  console.log(`静态文件服务已启动: /userimages -> ${userimagesPath}`);
+} else {
+  console.log(`警告: 用户图片目录不存在: ${userimagesPath}`);
+}
 
 // 创建数据库连接池
 const pool = mysql.createPool({
@@ -138,7 +156,118 @@ app.get('/healthz', (req, res) => {
   res.json({ status: 'ok', server: 'express' });
 });
 
+// 图片服务器健康检查
+imageApp.get('/healthz', (req, res) => {
+  res.json({ status: 'ok', server: 'image-server', port: imagePort });
+});
+
+// 图片上传接口
+imageApp.post('/api/user/:username/upload', (req, res) => {
+  const username = req.params.username;
+  const userDir = path.join(__dirname, 'backend', 'userimages', username, 'imagedehazed');
+  
+  // 确保用户目录存在
+  if (!fs.existsSync(userDir)) {
+    fs.mkdirSync(userDir, { recursive: true });
+  }
+  
+  // 这里可以添加文件上传逻辑
+  // 目前先返回成功状态
+  res.json({ message: '上传接口已准备就绪', uploadPath: userDir });
+});
+
+// 图片服务器添加目录浏览API
+imageApp.get('/api/user/:username/files', (req, res) => {
+  const username = req.params.username;
+  const userDir = path.join(__dirname, 'backend', 'userimages', username);
+  
+  if (!fs.existsSync(userDir)) {
+    return res.status(404).json({ message: '用户文件目录不存在' });
+  }
+  
+  const files = {
+    imageFiles: [],
+    videoFiles: []
+  };
+  
+  try {
+    // 读取图像去雾文件
+    const imageDir = path.join(userDir, 'imagedehazed');
+    if (fs.existsSync(imageDir)) {
+      const imageFiles = [];
+      fs.readdirSync(imageDir).forEach(file => {
+        if (file.toLowerCase().endsWith('.png') || file.toLowerCase().endsWith('.jpg') || file.toLowerCase().endsWith('.jpeg')) {
+          const filePath = path.join(imageDir, file);
+          if (fs.statSync(filePath).isFile()) {
+            const stats = fs.statSync(filePath);
+            imageFiles.push({
+              name: file,
+              path: `/userimages/${username}/imagedehazed/${file}`,
+              createdTime: stats.mtime.toISOString(),
+              size: stats.size,
+              type: 'image'
+            });
+          }
+        }
+      });
+      files.imageFiles = imageFiles.sort((a, b) => new Date(b.createdTime) - new Date(a.createdTime));
+    }
+    
+    // 读取视频去雾文件
+    const videoDir = path.join(userDir, 'videodehazed');
+    if (fs.existsSync(videoDir)) {
+      const videoFiles = [];
+      fs.readdirSync(videoDir).forEach(videoFolder => {
+        const videoFolderPath = path.join(videoDir, videoFolder);
+        if (fs.statSync(videoFolderPath).isDirectory()) {
+          const stats = fs.statSync(videoFolderPath);
+          const images = [];
+          
+          fs.readdirSync(videoFolderPath).forEach(frameFile => {
+            if (frameFile.toLowerCase().endsWith('.png') || frameFile.toLowerCase().endsWith('.jpg') || frameFile.toLowerCase().endsWith('.jpeg')) {
+              try {
+                const frameNum = parseInt(frameFile.split('.')[0]);
+                images.push({
+                  name: frameFile,
+                  path: `/userimages/${username}/videodehazed/${videoFolder}/${frameFile}`,
+                  frameNumber: frameNum
+                });
+              } catch (e) {
+                // 忽略无法解析的文件名
+              }
+            }
+          });
+          
+          images.sort((a, b) => a.frameNumber - b.frameNumber);
+          
+          videoFiles.push({
+            name: videoFolder,
+            path: `/userimages/${username}/videodehazed/${videoFolder}`,
+            createdTime: stats.mtime.toISOString(),
+            images: images,
+            frameCount: images.length,
+            type: 'video'
+          });
+        }
+      });
+      files.videoFiles = videoFiles.sort((a, b) => new Date(b.createdTime) - new Date(a.createdTime));
+    }
+    
+    res.json(files);
+  } catch (error) {
+    console.error('读取用户文件错误:', error);
+    res.status(500).json({ message: '读取文件列表失败', error: error.message });
+  }
+});
+
 // 启动服务
 app.listen(port, () => {
   console.log(`Server running at http://localhost:${port}`);
+});
+
+// 启动图片服务器
+imageApp.listen(imagePort, () => {
+  console.log(`图片服务器启动: http://localhost:${imagePort}`);
+  console.log(`图片访问地址: http://localhost:${imagePort}/userimages/`);
+  console.log(`用户文件API: http://localhost:${imagePort}/api/user/{username}/files`);
 });
