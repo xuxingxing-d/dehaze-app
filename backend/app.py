@@ -1,11 +1,13 @@
 import io
 import os
 import base64
-from typing import Optional
+from typing import Optional, List
+from datetime import datetime
 
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from PIL import Image
 import numpy as np
 import json
@@ -41,6 +43,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 添加静态文件服务
+# 为用户文件提供HTTP访问
+try:
+    userimages_path = os.path.join(os.path.dirname(__file__), 'userimages')
+    if os.path.exists(userimages_path):
+        app.mount("/userimages", StaticFiles(directory=userimages_path), name="userimages")
+        print(f"Static files mounted: /userimages -> {userimages_path}")
+except Exception as e:
+    print(f"Failed to mount static files: {e}")
 
 
 
@@ -415,6 +427,98 @@ async def video_dehaze_endpoint(
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok", "torch": TORCH_AVAILABLE}
+
+
+@app.get("/api/user/{username}/files")
+async def get_user_files(username: str):
+    """
+    获取用户的所有去雾文件列表
+    """
+    try:
+        # 验证用户名安全性
+        import re
+        safe_username = re.sub(r'[^a-zA-Z0-9_-]', '', username.strip())
+        if not safe_username or safe_username != username:
+            return JSONResponse(status_code=400, content={"message": "Invalid username"})
+        
+        user_dir = os.path.join(os.path.dirname(__file__), 'userimages', username)
+        
+        if not os.path.exists(user_dir):
+            return JSONResponse(status_code=404, content={"message": "用户文件目录不存在"})
+        
+        files = {
+            "imageFiles": [],
+            "videoFiles": []
+        }
+        
+        # 读取图像去雾文件
+        image_dir = os.path.join(user_dir, 'imagedehazed')
+        if os.path.exists(image_dir):
+            image_files = []
+            for file in os.listdir(image_dir):
+                if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    file_path = os.path.join(image_dir, file)
+                    if os.path.isfile(file_path):
+                        stat_info = os.stat(file_path)
+                        image_files.append({
+                            "name": file,
+                            "path": f"/userimages/{username}/imagedehazed/{file}",
+                            "createdTime": datetime.fromtimestamp(stat_info.st_mtime).isoformat(),
+                            "size": stat_info.st_size,
+                            "type": "image"
+                        })
+            
+            # 按创建时间排序（最新的在前）
+            files["imageFiles"] = sorted(image_files, 
+                                       key=lambda x: x["createdTime"], 
+                                       reverse=True)
+        
+        # 读取视频去雾文件
+        video_dir = os.path.join(user_dir, 'videodehazed')
+        if os.path.exists(video_dir):
+            video_files = []
+            for video_folder in os.listdir(video_dir):
+                video_folder_path = os.path.join(video_dir, video_folder)
+                if os.path.isdir(video_folder_path):
+                    stat_info = os.stat(video_folder_path)
+                    
+                    # 获取视频文件夹中的所有图像帧
+                    images = []
+                    for frame_file in os.listdir(video_folder_path):
+                        if frame_file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                            # 按数字排序（1.png, 2.png, ...）
+                            try:
+                                frame_num = int(frame_file.split('.')[0])
+                                images.append({
+                                    "name": frame_file,
+                                    "path": f"/userimages/{username}/videodehazed/{video_folder}/{frame_file}",
+                                    "frameNumber": frame_num
+                                })
+                            except ValueError:
+                                continue
+                    
+                    # 按帧号排序
+                    images.sort(key=lambda x: x["frameNumber"])
+                    
+                    video_files.append({
+                        "name": video_folder,
+                        "path": f"/userimages/{username}/videodehazed/{video_folder}",
+                        "createdTime": datetime.fromtimestamp(stat_info.st_mtime).isoformat(),
+                        "images": images,
+                        "frameCount": len(images),
+                        "type": "video"
+                    })
+            
+            # 按创建时间排序（最新的在前）
+            files["videoFiles"] = sorted(video_files, 
+                                       key=lambda x: x["createdTime"], 
+                                       reverse=True)
+        
+        return JSONResponse(content=files)
+        
+    except Exception as e:
+        print(f"Error reading user files: {e}")
+        return JSONResponse(status_code=500, content={"message": "读取文件列表失败", "error": str(e)})
 
 
 if __name__ == "__main__":
