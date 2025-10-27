@@ -3,14 +3,15 @@ import os
 import base64
 from typing import Optional, List
 from datetime import datetime
+import json
+import re
 
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 import numpy as np
-import json
 
 try:
     import torch
@@ -54,8 +55,51 @@ try:
 except Exception as e:
     print(f"Failed to mount static files: {e}")
 
+# 模拟用户数据库（在实际应用中应该使用真正的数据库）
+users_db = {}
 
+def sanitize_username(username: str) -> str:
+    """清理用户名，确保安全"""
+    return re.sub(r'[^a-zA-Z0-9_-]', '', username.strip())
 
+def user_exists(username: str) -> bool:
+    """检查用户是否存在"""
+    safe_username = sanitize_username(username)
+    user_dir = os.path.join(os.path.dirname(__file__), 'userimages', safe_username)
+    return os.path.exists(user_dir)
+
+def create_user(username: str, password: str) -> bool:
+    """创建新用户"""
+    safe_username = sanitize_username(username)
+    if user_exists(safe_username):
+        return False
+    
+    # 保存用户信息（在实际应用中应该加密存储密码）
+    users_db[safe_username] = {
+        "username": safe_username,
+        "password": password,  # 注意：实际应用中应该使用哈希加密
+        "created_at": datetime.now().isoformat()
+    }
+    
+    # 创建用户目录
+    try:
+        user_base_dir = os.path.join(os.path.dirname(__file__), 'userimages', safe_username)
+        user_image_dir = os.path.join(user_base_dir, 'imagedehazed')
+        user_video_dir = os.path.join(user_base_dir, 'videodehazed')
+        
+        os.makedirs(user_image_dir, exist_ok=True)
+        os.makedirs(user_video_dir, exist_ok=True)
+        return True
+    except Exception as e:
+        print(f"Failed to create user directories: {e}")
+        return False
+
+def authenticate_user(username: str, password: str) -> bool:
+    """验证用户凭据"""
+    safe_username = sanitize_username(username)
+    if safe_username in users_db and users_db[safe_username]["password"] == password:
+        return True
+    return False
 
 class DehazeModelWrapper:
     """Thin wrapper to hold a model and run inference.
@@ -152,6 +196,80 @@ def compute_niqe_from_pil(img: Image.Image) -> Optional[float]:
         return None
 
 
+@app.post("/api/register")
+async def register_user(
+    username: str = Form(...),
+    password: str = Form(...)
+):
+    """
+    用户注册接口
+    """
+    try:
+        if not username or not username.strip():
+            raise HTTPException(status_code=400, detail="用户名不能为空")
+        
+        if not password or len(password) < 6:
+            raise HTTPException(status_code=400, detail="密码长度不能少于6位")
+        
+        safe_username = sanitize_username(username)
+        if not safe_username:
+            raise HTTPException(status_code=400, detail="用户名包含无效字符")
+        
+        # 检查用户是否已存在
+        if user_exists(safe_username):
+            raise HTTPException(status_code=409, detail="用户名已存在")
+        
+        # 创建用户
+        if create_user(safe_username, password):
+            return JSONResponse({
+                "status": "success",
+                "message": "注册成功",
+                "username": safe_username
+            })
+        else:
+            raise HTTPException(status_code=500, detail="注册失败")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"注册过程中发生错误: {e}")
+
+
+@app.post("/api/login")
+async def login_user(
+    username: str = Form(...),
+    password: str = Form(...)
+):
+    """
+    用户登录接口
+    """
+    try:
+        if not username or not username.strip():
+            raise HTTPException(status_code=400, detail="用户名不能为空")
+        
+        if not password:
+            raise HTTPException(status_code=400, detail="密码不能为空")
+        
+        safe_username = sanitize_username(username)
+        if not safe_username:
+            raise HTTPException(status_code=400, detail="用户名包含无效字符")
+        
+        # 验证用户凭据
+        if authenticate_user(safe_username, password):
+            return JSONResponse({
+                "status": "success",
+                "message": "登录成功",
+                "username": safe_username
+            })
+        else:
+            raise HTTPException(status_code=401, detail="用户名或密码错误")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"登录过程中发生错误: {e}")
+
+
 @app.post("/api/dehaze")
 async def dehaze_endpoint(
     image: UploadFile = File(...),
@@ -172,11 +290,16 @@ async def dehaze_endpoint(
         if not username:
             return JSONResponse(status_code=400, content={"message": "username is required"})
         
-        # 3) 根据参数选择对应的数据集目录和测试脚本
+        # 3) 验证用户是否存在
+        safe_username = sanitize_username(username)
+        if not user_exists(safe_username):
+            return JSONResponse(status_code=404, content={"message": "用户不存在"})
+        
+        # 4) 根据参数选择对应的数据集目录和测试脚本
         dataset_name = f'Haze1k_{dataset}'
         test_script = f'test-{dataset}{network}.py'
 
-        # 4) 将图片保存到指定数据集目录 backend/data/{dataset_name}/test/hazy/(1).png
+        # 5) 将图片保存到指定数据集目录 backend/data/{dataset_name}/test/hazy/(1).png
         try:
             dataset_hazy_dir = os.path.join(os.path.dirname(__file__), 'data', dataset_name, 'test', 'hazy')
             os.makedirs(dataset_hazy_dir, exist_ok=True)
@@ -187,7 +310,7 @@ async def dehaze_endpoint(
             print(f"Failed to save hazy image: {save_err}")
             return JSONResponse(status_code=400, content={"message": f"Save hazy failed: {save_err}"})
 
-        # 5) 运行对应的 test-{dataset}{network}.py（以当前 backend 为工作目录）
+        # 6) 运行对应的 test-{dataset}{network}.py（以当前 backend 为工作目录）
         try:
             import subprocess, sys
             backend_dir = os.path.dirname(__file__)
@@ -209,16 +332,16 @@ async def dehaze_endpoint(
             print(f"Unexpected error running {test_script}: {e}")
             return JSONResponse(status_code=500, content={"message": f"Unexpected error: {e}"})
 
-        # 6) 读取去雾结果 backend/results/{dataset_name}/{model_name}/imgs/(1).png 并返回
+        # 7) 读取去雾结果 backend/results/{dataset_name}/{model_name}/imgs/(1).png 并返回
         # 根据不同的网络选择不同的模型名称
         model_name = 'dehazeformer-t' if network == '1' else 'dehazeformer-s'
         result_path = os.path.join(os.path.dirname(__file__), 'results', dataset_name, model_name, 'imgs', '(1).png')
         
-        # 7) 确保用户目录存在并复制结果到用户专属目录
+        # 8) 确保用户目录存在并复制结果到用户专属目录
         try:
             # 创建用户专属目录
-            user_image_dir = os.path.join(os.path.dirname(__file__), 'userimages', username, 'imagedehazed')
-            user_video_dir = os.path.join(os.path.dirname(__file__), 'userimages', username, 'videodehazed')
+            user_image_dir = os.path.join(os.path.dirname(__file__), 'userimages', safe_username, 'imagedehazed')
+            user_video_dir = os.path.join(os.path.dirname(__file__), 'userimages', safe_username, 'videodehazed')
             os.makedirs(user_image_dir, exist_ok=True)
             os.makedirs(user_video_dir, exist_ok=True)
             
@@ -260,7 +383,7 @@ async def dehaze_endpoint(
             "dataset": dataset,
             "network": network,
             "test_script_used": test_script,
-            "username": username,
+            "username": safe_username,
             "user_result_path": user_result_path if 'user_result_path' in locals() else None,
             "record_file": os.path.join(user_image_dir, 'image_records.txt') if 'user_image_dir' in locals() else None,
         })
@@ -280,10 +403,13 @@ async def create_user_directories(
             return JSONResponse(status_code=400, content={"message": "username is required and cannot be empty"})
         
         # 清理用户名，确保安全（移除特殊字符）
-        import re
-        safe_username = re.sub(r'[^a-zA-Z0-9_-]', '', username.strip())
+        safe_username = sanitize_username(username.strip())
         if not safe_username:
             return JSONResponse(status_code=400, content={"message": "username contains invalid characters"})
+        
+        # 检查用户是否已存在
+        if user_exists(safe_username):
+            return JSONResponse(status_code=409, content={"message": "用户已存在"})
         
         # 创建用户专属目录
         user_base_dir = os.path.join(os.path.dirname(__file__), 'userimages', safe_username)
@@ -330,14 +456,18 @@ async def video_dehaze_endpoint(
         if not video_name:
             return JSONResponse(status_code=400, content={"message": "video_name is required"})
         
+        # 验证用户是否存在
+        safe_username = sanitize_username(username)
+        if not user_exists(safe_username):
+            return JSONResponse(status_code=404, content={"message": "用户不存在"})
+        
         # 清理视频名称，确保安全
-        import re
-        safe_video_name = re.sub(r'[^a-zA-Z0-9_-]', '', video_name.strip())
+        safe_video_name = sanitize_username(video_name.strip())
         if not safe_video_name:
             return JSONResponse(status_code=400, content={"message": "video_name contains invalid characters"})
         
         # 创建视频专属目录
-        user_video_dir = os.path.join(os.path.dirname(__file__), 'userimages', username, 'videodehazed', safe_video_name)
+        user_video_dir = os.path.join(os.path.dirname(__file__), 'userimages', safe_username, 'videodehazed', safe_video_name)
         os.makedirs(user_video_dir, exist_ok=True)
         
         processed_frames = []
@@ -410,7 +540,7 @@ async def video_dehaze_endpoint(
             "status": "success",
             "message": f"Video dehaze completed for {len(processed_frames)} frames",
             "video_name": safe_video_name,
-            "username": username,
+            "username": safe_username,
             "dataset": dataset,
             "network": network,
             "frames_processed": len(processed_frames),
@@ -436,12 +566,15 @@ async def get_user_files(username: str):
     """
     try:
         # 验证用户名安全性
-        import re
-        safe_username = re.sub(r'[^a-zA-Z0-9_-]', '', username.strip())
+        safe_username = sanitize_username(username)
         if not safe_username or safe_username != username:
             return JSONResponse(status_code=400, content={"message": "Invalid username"})
         
-        user_dir = os.path.join(os.path.dirname(__file__), 'userimages', username)
+        # 验证用户是否存在
+        if not user_exists(safe_username):
+            return JSONResponse(status_code=404, content={"message": "用户不存在"})
+        
+        user_dir = os.path.join(os.path.dirname(__file__), 'userimages', safe_username)
         
         if not os.path.exists(user_dir):
             return JSONResponse(status_code=404, content={"message": "用户文件目录不存在"})
@@ -462,7 +595,7 @@ async def get_user_files(username: str):
                         stat_info = os.stat(file_path)
                         image_files.append({
                             "name": file,
-                            "path": f"/userimages/{username}/imagedehazed/{file}",
+                            "path": f"/userimages/{safe_username}/imagedehazed/{file}",
                             "createdTime": datetime.fromtimestamp(stat_info.st_mtime).isoformat(),
                             "size": stat_info.st_size,
                             "type": "image"
@@ -491,7 +624,7 @@ async def get_user_files(username: str):
                                 frame_num = int(frame_file.split('.')[0])
                                 images.append({
                                     "name": frame_file,
-                                    "path": f"/userimages/{username}/videodehazed/{video_folder}/{frame_file}",
+                                    "path": f"/userimages/{safe_username}/videodehazed/{video_folder}/{frame_file}",
                                     "frameNumber": frame_num
                                 })
                             except ValueError:
@@ -502,7 +635,7 @@ async def get_user_files(username: str):
                     
                     video_files.append({
                         "name": video_folder,
-                        "path": f"/userimages/{username}/videodehazed/{video_folder}",
+                        "path": f"/userimages/{safe_username}/videodehazed/{video_folder}",
                         "createdTime": datetime.fromtimestamp(stat_info.st_mtime).isoformat(),
                         "images": images,
                         "frameCount": len(images),
@@ -529,5 +662,3 @@ if __name__ == "__main__":
     
     # 启动服务器
     uvicorn.run(app, host=host, port=port, log_level="info")
-
-
