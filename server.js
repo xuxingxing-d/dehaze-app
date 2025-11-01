@@ -2,7 +2,6 @@ const express = require('express');
 const mysql = require('mysql2');
 const bodyParser = require('body-parser');
 const cors = require('cors');
-const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
@@ -13,16 +12,6 @@ const port = 3001; // 使用3001端口
 const imageApp = express();
 const imagePort = 3002; // 图片服务端口
 
-// 启动 Python 服务
-const pythonProcess = spawn('python', ['backend/app.py'], {
-  stdio: 'inherit', // 让 Python 的输出显示在 Node 控制台
-  shell: true       // 兼容性更好
-});
-
-pythonProcess.on('close', (code) => {
-  console.log(`Python process exited with code ${code}`);
-});
-
 // 允许跨域请求
 app.use(cors());
 app.use(bodyParser.json());
@@ -32,7 +21,7 @@ imageApp.use(cors());
 imageApp.use(bodyParser.json());
 imageApp.use(bodyParser.urlencoded({ extended: true }));
 
-// 注意：静态文件服务已移至Python服务(3000端口)，避免重复
+// 注意：静态文件服务由Python服务(3000端口)提供
 
 // 创建数据库连接池
 const pool = mysql.createPool({
@@ -169,7 +158,7 @@ imageApp.post('/api/user/:username/upload', (req, res) => {
   res.json({ message: '上传接口已准备就绪', uploadPath: userDir });
 });
 
-// 注意：用户文件列表API已移至Python服务(3000端口)，避免重复
+// 注意：用户文件列表API由Python服务(3000端口)提供
 
 // 启动服务
 app.listen(port, () => {
