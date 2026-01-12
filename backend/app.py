@@ -108,7 +108,7 @@ class DehazeModelWrapper:
 
     def __init__(self) -> None:
         self.model = None
-        self.device = "cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"
+        self.device = "cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"  # type: ignore
         self.model_path = os.getenv("MODEL_PATH", "models/model.pth")
         self.model_type = os.getenv("MODEL_TYPE", "pytorch")  # pytorch|torchscript
         self.half = os.getenv("USE_HALF", "0") == "1"
@@ -121,7 +121,7 @@ class DehazeModelWrapper:
             return
         try:
             if self.model_type == "torchscript":
-                self.model = torch.jit.load(self.model_path, map_location=self.device)
+                self.model = torch.jit.load(self.model_path, map_location=self.device)  # type: ignore
             else:
                 # NOTE: You must define the model architecture to load state_dict.
                 # For now, we attempt to load a scripted model; otherwise keep None.
@@ -140,7 +140,7 @@ class DehazeModelWrapper:
         if not TORCH_AVAILABLE:
             return None
         arr = np.array(img_pil.convert("RGB"))
-        tensor = torch.from_numpy(arr).permute(2, 0, 1).float() / 255.0
+        tensor = torch.from_numpy(arr).permute(2, 0, 1).float() / 255.0  # type: ignore
         tensor = tensor.unsqueeze(0)  # NCHW
         if self.half and self.device == "cuda":
             tensor = tensor.half()
@@ -155,6 +155,8 @@ class DehazeModelWrapper:
         # Simple fallback: apply CLAHE on the L channel in LAB space
         if not OPENCV_AVAILABLE:
             return img_pil
+        # 重新导入cv2以确保静态分析工具能正确识别绑定
+        import cv2  # type: ignore
         img = np.array(img_pil.convert("RGB"))
         lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
         l, a, b = cv2.split(lab)
@@ -168,7 +170,7 @@ class DehazeModelWrapper:
         # If a TorchScript model is loaded, use it; otherwise, fallback to simple enhancement
         if self.model is not None and TORCH_AVAILABLE:
             x = self._preprocess(img_pil)
-            with torch.no_grad():
+            with torch.no_grad():  # type: ignore
                 y = self.model(x)
             return self._postprocess(y)
         # Fallback (keeps service functional; replace with your real model)
@@ -281,6 +283,11 @@ async def dehaze_endpoint(
         # 1) 读取上传图片
         content = await image.read()
         img = Image.open(io.BytesIO(content)).convert("RGB")
+        
+        # 初始化变量
+        user_result_path = None
+        user_image_dir = None
+        record_file_path = None
 
         # 2) 验证参数
         if dataset not in ['thin', 'moderate', 'thick']:
@@ -325,7 +332,7 @@ async def dehaze_endpoint(
             print(completed.stdout)
             if completed.stderr:
                 print(completed.stderr)
-        except subprocess.CalledProcessError as run_err:
+        except subprocess.CalledProcessError as run_err:  # type: ignore
             print(f"{test_script} failed: {run_err.stderr}")
             return JSONResponse(status_code=500, content={"message": f"{test_script} execution failed"})
         except Exception as e:
@@ -378,14 +385,21 @@ async def dehaze_endpoint(
         out_img = Image.open(result_path).convert("RGB")
 
         b64 = image_to_base64(out_img)
+        
+        # 确保变量有默认值
+        if 'user_result_path' not in locals():
+            user_result_path = None
+        if 'record_file_path' not in locals():
+            record_file_path = None
+        
         return JSONResponse({
             "image_base64": f"data:image/png;base64,{b64}",
             "dataset": dataset,
             "network": network,
             "test_script_used": test_script,
             "username": safe_username,
-            "user_result_path": user_result_path if 'user_result_path' in locals() else None,
-            "record_file": os.path.join(user_image_dir, 'image_records.txt') if 'user_image_dir' in locals() else None,
+            "user_result_path": user_result_path,
+            "record_file": record_file_path,
         })
     except Exception as e:
         return JSONResponse(status_code=400, content={"message": f"Dehaze failed: {e}"})
@@ -435,7 +449,7 @@ async def create_user_directories(
 
 @app.post("/api/video-dehaze")
 async def video_dehaze_endpoint(
-    video_frames: list[UploadFile] = File(...),  # 视频帧列表
+    video_frames: List[UploadFile] = File(...),  # 视频帧列表
     video_name: str = Form(...),  # 视频名称
     dataset: Optional[str] = Form(None),  # thin, moderate, thick
     network: Optional[str] = Form(None),  # 1, 2

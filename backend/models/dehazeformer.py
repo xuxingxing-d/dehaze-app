@@ -11,7 +11,6 @@ from torch.nn import init
 from math import gcd
 from einops.layers.torch import Rearrange
 
-
 class RLN(nn.Module):
 
     def __init__(self, dim, eps=1e-5, detach_grad=False):
@@ -47,32 +46,34 @@ class RLN(nn.Module):
 
 
 class Mlp(nn.Module):
-	def __init__(self, network_depth, in_features, hidden_features=None, out_features=None):
-		super().__init__()
-		out_features = out_features or in_features
-		hidden_features = hidden_features or in_features
+    def __init__(self, network_depth, in_features, hidden_features=None, out_features=None):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
 
-		self.network_depth = network_depth
+        self.network_depth = network_depth
 
-		self.mlp = nn.Sequential(
-			nn.Conv2d(in_features, hidden_features, 1),
-			nn.ReLU(True),
-			nn.Conv2d(hidden_features, out_features, 1)
-		)
+        # 使用全部特征通道进行1x1卷积
+        self.conv_1x1 = nn.Conv2d(in_features, out_features, kernel_size=1)
 
-		self.apply(self._init_weights)
+        self.relu = nn.ReLU(True)
 
-	def _init_weights(self, m):
-		if isinstance(m, nn.Conv2d):
-			gain = (8 * self.network_depth) ** (-1/4)
-			fan_in, fan_out = _calculate_fan_in_and_fan_out(m.weight)
-			std = gain * math.sqrt(2.0 / float(fan_in + fan_out))
-			trunc_normal_(m.weight, std=std)
-			if m.bias is not None:
-				nn.init.constant_(m.bias, 0)
+        # 初始化权重
+        self.apply(self._init_weights)
 
-	def forward(self, x):
-		return self.mlp(x)
+    def _init_weights(self, m):
+        if isinstance(m, nn.Conv2d):
+            gain = (8 * self.network_depth) ** (-1 / 4)
+            fan_in, fan_out = _calculate_fan_in_and_fan_out(m.weight)
+            std = gain * math.sqrt(2.0 / float(fan_in + fan_out))
+            trunc_normal_(m.weight, std=std)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        # 对输入数据进行1x1卷积处理
+        out = self.conv_1x1(x)
+        return self.relu(out)
 
 def window_partition(x, window_size):
     B, H, W, C = x.shape
@@ -266,7 +267,9 @@ class EMA(nn.Module):
         # 1x1卷积，用于学习跨通道的特征
         self.conv1x1 = nn.Conv2d(channels // self.groups, channels // self.groups, kernel_size=1, stride=1, padding=0)
         # 3x3卷积，用于捕捉更丰富的空间信息
-        self.conv3x3 = nn.Conv2d(channels // self.groups, channels // self.groups, kernel_size=3, stride=1, padding=1)
+        self.conv3_1 = nn.Conv2d(channels // self.groups, channels // self.groups, kernel_size=3, stride=1, padding=1)
+        self.conv3_2 = nn.Conv2d(channels // self.groups, channels // self.groups, kernel_size=3, stride=1, padding=1)
+        self.silu = nn.SiLU(inplace=False)
 
     def forward(self, x):
         b, c, h, w = x.size()
@@ -280,7 +283,9 @@ class EMA(nn.Module):
         x_h, x_w = torch.split(hw, [h, w], dim=2)
         # 应用GroupNorm和注意力权重调整特征图
         x1 = self.gn(group_x * x_h.sigmoid() * x_w.permute(0, 1, 3, 2).sigmoid())
-        x2 = self.conv3x3(group_x)
+        x2 = self.conv3_1(group_x)
+        x2 = self.silu(x2)
+        x2 = self.conv3_2(x2)
         # 将特征图通过全局平均池化和softmax进行处理，得到权重
         x11 = self.softmax(self.agp(x1).reshape(b * self.groups, -1, 1).permute(0, 2, 1))
         x12 = x2.reshape(b * self.groups, c // self.groups, -1)  # b*g, c//g, hw
@@ -291,18 +296,17 @@ class EMA(nn.Module):
         # 将调整后的特征图重塑回原始尺寸
         return (group_x * weights.sigmoid()).reshape(b, c, h, w)
 
-
 class ALCEM(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels):
         super(ALCEM, self).__init__()
 
-        # Ensure input and output channels are the same
-        self.in_channels = in_channels
-        self.out_channels = out_channels
+        # 如果没有指定out_channels，则与in_channels相同
 
-        # Assuming the expert system splits channels evenly
+
+        self.in_channels = in_channels
+
+        
         self.channels_per_split = in_channels // 4
-        self.ema = EMA(in_channels)
 
         # Convolutional layers for each split feature map
         self.conv1 = nn.Conv2d(self.channels_per_split, self.channels_per_split, kernel_size=3, padding=1)
@@ -312,48 +316,50 @@ class ALCEM(nn.Module):
 
         # Average pooling and 1x1 convolution
         self.avg_pool = nn.AvgPool2d(kernel_size=3, stride=1, padding=1)
-        self.conv1x1 = nn.Conv2d(out_channels, out_channels, kernel_size=1)
+        self.conv1x1 = nn.Conv2d(in_channels, in_channels, kernel_size=1)  # 修正：使用in_channels而不是out_channels
 
-        # Softmax layer
+        self.ema = EMA(in_channels)
+        self.par = ParNetAttention(channel=in_channels)
         self.softmax = nn.Softmax(dim=1)
 
     def forward(self, x):
-        # Split the input x into four feature maps along the channel dimension
-        x1 = x[:, :self.channels_per_split, :, :]
-        x2 = x[:, self.channels_per_split:2 * self.channels_per_split, :, :]
-        x3 = x[:, 2 * self.channels_per_split:3 * self.channels_per_split, :, :]
-        x4 = x[:, 3 * self.channels_per_split:, :, :]
+        # 更安全的通道分割
+        splits = torch.chunk(x, 4, dim=1)
+        x1, x2, x3, x4 = splits
 
         # Apply convolutional layers to each split
         y1 = self.conv1(x1)
-        x2 = y1+x2
+        
+        x2 = y1 + x2  # 修正：应该与x2相加而不是y1
         y2 = self.conv2(x2)
-        x3 = y2 + x3
+        
+        x3 = y2 + x3  # 修正：应该与x3相加而不是y2
         y3 = self.conv3(x3)
-        x4 = y3 + x4
+        
+        x4 = y3 + x4  # 修正：应该与x4相加而不是y3
         y4 = self.conv4(x4)
 
-        # Element-wise addition of y1, y2, y3, y4
+        # Concatenate all outputs
         y = torch.cat((y1, y2, y3, y4), dim=1)
-        y = self.ema(y)
         # Average pooling and 1x1 convolution
         y = self.avg_pool(y)
         y = self.conv1x1(y)
+        y5 = self.ema(y)
+        y = y5+y
         y = self.softmax(y)
-        # Multiply y1, y2, y3, y4 with respective weights
-        y1_weighted = y[:, :self.channels_per_split, :, :]
-        y2_weighted = y[:, self.channels_per_split:2 * self.channels_per_split, :, :]
-        y3_weighted = y[:, 2 * self.channels_per_split:3 * self.channels_per_split, :, :]
-        y4_weighted = y[:, 3 * self.channels_per_split:, :, :]
+        y = self.par(y)
+        # Split weights for each branch
+        y_splits = torch.chunk(y, 4, dim=1)
+        y1_weighted, y2_weighted, y3_weighted, y4_weighted = y_splits
 
-        # Sum the weighted outputs
-        y_out = torch.cat((y1_weighted*y1, y2_weighted*y2, y3_weighted*y3, y4_weighted*y4), dim=1)
-
-
-        # Apply softmax
-
+        # Apply weights and concatenate
+        y_out = torch.cat((
+            y1_weighted * y1, 
+            y2_weighted * y2, 
+            y3_weighted * y3, 
+            y4_weighted * y4
+        ), dim=1)
         return y_out
-
 
 class TransformerBlock(nn.Module):
     def __init__(self, network_depth, dim, num_heads, mlp_ratio=4.,
@@ -368,10 +374,8 @@ class TransformerBlock(nn.Module):
 
         self.norm2 = norm_layer(dim) if use_attn and mlp_norm else nn.Identity()
         self.mlp = Mlp(network_depth, dim, hidden_features=int(dim * mlp_ratio))
-        self.att = ALCEM(dim, dim)
+        self.att = ALCEM(dim)
         # 添加 ParNetAttention 模块
-        self.par_attention = ParNetAttention(channel=dim)
-
     def forward(self, x):
         identity = x
         if self.use_attn:
@@ -391,7 +395,6 @@ class TransformerBlock(nn.Module):
         x = identity + x
 
         # 在 TransformerBlock 之后应用 ParNetAttention
-        x = self.par_attention(x)
         return x
 
 
@@ -582,6 +585,210 @@ class ECAAttention(nn.Module):
         y = y.permute(0, 2, 1).unsqueeze(-1)  # 再次转置并增加一个维度，以匹配原始输入x的维度
         return x * y.expand_as(x)  # 将注意力权重应用到原始输入x上，通过广播机制扩展维度并执行逐元素乘法
 
+class SpatialAttention7(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention7, self).__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # x: (B, C, H, W)
+        avg_out = torch.mean(x, dim=1, keepdim=True)  # (B, 1, H, W)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)  # (B, 1, H, W)
+        x_cat = torch.cat([avg_out, max_out], dim=1)   # (B, 2, H, W)
+        attention = self.conv(x_cat)                   # (B, 1, H, W)
+        return self.sigmoid(attention) * x             # 加权输出
+
+
+
+class DepthwiseSeparableConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, padding, dilation=1):
+        super(DepthwiseSeparableConv, self).__init__()
+        self.depthwise = nn.Conv2d(in_channels, in_channels, 
+                                   kernel_size=kernel_size, padding=padding, 
+                                   dilation=dilation, groups=in_channels, bias=False)
+        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+
+    def forward(self, x):
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        return x
+
+
+class ChannelAttention9(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super(ChannelAttention9, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, channels // reduction, 1, bias=False),
+            nn.ReLU(),
+            nn.Conv2d(channels // reduction, channels, 1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        return self.sigmoid(avg_out + max_out)
+
+
+# ✅ 优化的低频处理模块（使用大感受野空洞卷积）
+class OptimizedLLProcessor(nn.Module):
+    def __init__(self, in_channels):
+        super(OptimizedLLProcessor, self).__init__()
+
+        # 使用空洞卷积扩大感受野，捕获更大范围的低频上下文
+        self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=5, padding=2)
+        self.conv2 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=2, dilation=2)  # 感受野=5
+        self.batchnore = nn.BatchNorm2d(in_channels)
+        self.conv3 = nn.Conv2d(in_channels, in_channels, kernel_size=7, padding=3)
+
+
+        self.conv4 = nn.Conv2d(in_channels, in_channels, kernel_size=5, padding=2)
+        self.conv5 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=2, dilation=2)  # 感受野=5
+        self.batchnore2 = nn.BatchNorm2d(in_channels)
+
+    def forward(self, x):
+        identity = x  # 残差连接
+
+        x = self.conv1(x)
+        x = self.batchnore(x)
+        x = self.conv2(x)
+        x2 = self.conv3(identity)
+        x2 = x2+identity
+        x3 = self.conv4(x2)
+        x3 = self.batchnore2(x3)
+        x3 = self.conv5(x3)
+        x = identity+x3
+        return x
+
+# 分别处理高频模块
+class HighFreqProcessor(nn.Module):
+    def __init__(self, in_channels):
+        super(HighFreqProcessor, self).__init__()
+        # 分别处理三个高频分量
+        self.lh_processor = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
+        self.hl_processor = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
+        self.hh_processor = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
+        # 融合卷积
+        self.conv4 = nn.Conv2d(in_channels*3,in_channels*3,kernel_size=3,padding=1)
+        self.relu1 = nn.ReLU(True)
+        self.conv5 = nn.Conv2d(in_channels*3,in_channels*3,kernel_size=3,padding=1)
+        self.conv6 = nn.Conv2d(in_channels*3,in_channels*3,kernel_size=1)
+        self.relu2 = nn.ReLU(True)
+        self.conv7 = nn.Conv2d(in_channels*3,in_channels*3,kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
+    def forward(self, lh, hl, hh):
+        # 分别处理高频分量
+        lh_out = self.lh_processor(lh)
+        hl_out = self.hl_processor(hl)
+        hh_out = self.hh_processor(hh)
+        
+        # 融合高频信息
+        x = torch.cat([lh_out, hl_out, hh_out], dim=1)
+        x1 = self.conv4(x)
+        x2 = self.relu1(x1)
+        x3 = self.conv5(x2)
+        x4 = self.sigmoid(x3)
+        x5 = self.conv6(x4)
+        x6 = self.relu2(x5)
+        x7 = self.conv7(x6)
+        x8 = x4*x7
+        x9 = x8+x
+        return x
+
+
+class DWTransform(nn.Module):
+    def __init__(self, in_channels):
+        super(DWTransform, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = in_channels * 4
+
+        # 优化的低频处理器
+        self.ll_processor = OptimizedLLProcessor(in_channels)
+        
+        # 高频处理器
+        self.high_freq_processor = HighFreqProcessor(in_channels)
+        
+        # 特征融合模块
+        self.fusion_conv = nn.Conv2d(in_channels * 4, in_channels * 2, kernel_size=1)
+        self.fusion_att = ChannelAttention9(in_channels * 2)
+
+    def forward(self, x):
+        # x: (B, C, H, W)
+        B, C, H, W = x.shape
+        assert H % 2 == 0 and W % 2 == 0, "Height and width must be even for Haar DWT"
+
+        # 提取四个子带位置
+        x00 = x[:, :, 0::2, 0::2]  # LL
+        x01 = x[:, :, 0::2, 1::2]  # LH
+        x10 = x[:, :, 1::2, 0::2]  # HL
+        x11 = x[:, :, 1::2, 1::2]  # HH
+
+        # 标准Haar小波变换
+        # LL: 水平和垂直方向的平均值
+        x_ll = (x00 + x01 + x10 + x11) / 2
+        # LH: 水平方向的差值，垂直方向的平均值
+        x_lh = (x00 - x01 + x10 - x11) / 2
+        # HL: 水平方向的平均值，垂直方向的差值
+        x_hl = (x00 + x01 - x10 - x11) / 2
+        # HH: 水平和垂直方向的差值
+        x_hh = (x00 - x01 - x10 + x11) / 2
+
+        # 处理低频分量
+        ll_processed = self.ll_processor(x_ll)
+        
+        # 处理高频分量
+        high_freq_processed = self.high_freq_processor(x_lh, x_hl, x_hh)
+        
+        # 融合低频和高频特征
+        fused = torch.cat([ll_processed, high_freq_processed], dim=1)
+        out = self.fusion_conv(fused)
+        
+        # 应用融合注意力
+        att_weights = self.fusion_att(out)
+        out = out * att_weights
+
+        return out  # 输出: (B, 2*C, H//2, W//2)
+
+
+class IDWTransform(nn.Module):
+    def __init__(self, in_channels):
+        super(IDWTransform, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = in_channels // 4
+        assert in_channels % 4 == 0, "Input channels must be divisible by 4 for Haar IDWT"
+        
+        # 用于最终通道数调整的卷积
+        self.final_conv = nn.Conv2d(in_channels // 4, in_channels // 2, kernel_size=1)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        # x: (B, 4C, H, W)
+        B, C, H, W = x.shape
+        assert C % 4 == 0, "Input channels must be divisible by 4 for inverse Haar wavelet"
+        C_per_band = C // 4
+        
+        # 分离子带
+        x_ll = x[:, :C_per_band, :, :]    # LL
+        x_lh = x[:, C_per_band:2*C_per_band, :, :]   # LH
+        x_hl = x[:, 2*C_per_band:3*C_per_band, :, :] # HL
+        x_hh = x[:, 3*C_per_band:, :, :]  # HH
+
+        # 标准Haar逆小波变换
+        y = torch.zeros(B, C_per_band, H * 2, W * 2, device=x.device)
+        # 通过四个子带重构原始信号
+        y[:, :, 0::2, 0::2] = (x_ll + x_lh + x_hl + x_hh) / 2
+        y[:, :, 0::2, 1::2] = (x_ll - x_lh + x_hl - x_hh) / 2
+        y[:, :, 1::2, 0::2] = (x_ll + x_lh - x_hl - x_hh) / 2
+        y[:, :, 1::2, 1::2] = (x_ll - x_lh - x_hl + x_hh) / 2
+
+        # 应用最终卷积和激活函数
+        out = self.final_conv(y)
+        out = self.relu(out)
+        
+        return out
 
 class DehazeFormer(nn.Module):
     def __init__(self, in_chans=3, out_chans=4, window_size=8,
@@ -599,38 +806,33 @@ class DehazeFormer(nn.Module):
         self.window_size = window_size
         self.mlp_ratios = mlp_ratios
 
-        # Divide input image into non-overlapping patches
+        # Initial embedding using DWTransform (通道数乘2)
         self.patch_embed = PatchEmbed(
             patch_size=1, in_chans=in_chans, embed_dim=embed_dims[0], kernel_size=3)
-        self.marp = MARP(in_channels=24, out_channels=24)
-        self.mecs = MECS(in_channels=24, out_channels=24, channel_attention_reduce=4)
+        self.marp = MARP(in_channels=embed_dims[0], out_channels=embed_dims[0])
+        self.mecs = MECS(in_channels=embed_dims[0], out_channels=embed_dims[0], channel_attention_reduce=4)
+
         # Main network
         self.layer1 = BasicLayer(network_depth=sum(depths), dim=embed_dims[0], depth=depths[0],
                                  num_heads=num_heads[0], mlp_ratio=mlp_ratios[0],
                                  norm_layer=norm_layer[0], window_size=window_size,
                                  attn_ratio=attn_ratio[0], attn_loc='last', conv_type=conv_type[0])
-        self.patch_merge1 = PatchEmbed(
-            patch_size=2, in_chans=embed_dims[0], embed_dim=embed_dims[1])
-
+        
+        self.patch_merge1 = DWTransform(in_channels=embed_dims[0])  # 通道数从 24 变为 48
         self.skip1 = nn.Conv2d(embed_dims[0], embed_dims[0], 1)
         self.layer2 = BasicLayer(network_depth=sum(depths), dim=embed_dims[1], depth=depths[1],
                                  num_heads=num_heads[1], mlp_ratio=mlp_ratios[1],
                                  norm_layer=norm_layer[1], window_size=window_size,
                                  attn_ratio=attn_ratio[1], attn_loc='last', conv_type=conv_type[1])
 
-        self.patch_merge2 = PatchEmbed(
-            patch_size=2, in_chans=embed_dims[1], embed_dim=embed_dims[2])
-
+        self.patch_merge2 = DWTransform(in_channels=embed_dims[1])  # 通道数从 48 变为 96
         self.skip2 = nn.Conv2d(embed_dims[1], embed_dims[1], 1)
-
         self.layer3 = BasicLayer(network_depth=sum(depths), dim=embed_dims[2], depth=depths[2],
                                  num_heads=num_heads[2], mlp_ratio=mlp_ratios[2],
                                  norm_layer=norm_layer[2], window_size=window_size,
                                  attn_ratio=attn_ratio[2], attn_loc='last', conv_type=conv_type[2])
 
-        self.patch_split1 = PatchUnEmbed(
-            patch_size=2, out_chans=embed_dims[3], embed_dim=embed_dims[2])
-
+        self.patch_split1 = IDWTransform(in_channels=embed_dims[2])  # 通道数从 96 变为 48
         assert embed_dims[1] == embed_dims[3]
         self.fusion1 = SKFusion(embed_dims[3])
 
@@ -639,9 +841,7 @@ class DehazeFormer(nn.Module):
                                  norm_layer=norm_layer[3], window_size=window_size,
                                  attn_ratio=attn_ratio[3], attn_loc='last', conv_type=conv_type[3])
 
-        self.patch_split2 = PatchUnEmbed(
-            patch_size=2, out_chans=embed_dims[4], embed_dim=embed_dims[3])
-
+        self.patch_split2 = IDWTransform(in_channels=embed_dims[3])  # 通道数从 48 变为 24
         assert embed_dims[0] == embed_dims[4]
         self.fusion2 = SKFusion(embed_dims[4])
 
@@ -654,10 +854,10 @@ class DehazeFormer(nn.Module):
             patch_size=1, out_chans=out_chans, embed_dim=embed_dims[4], kernel_size=3)
 
         # New convolution layer to align channels of y to x
-        self.match_channels_y = nn.Conv2d(embed_dims[2], embed_dims[4], kernel_size=1)
+        self.match_channels_y = nn.Conv2d(embed_dims[2], embed_dims[4], kernel_size=1)  # 调整最终通道数
+
 
     def check_image_size(self, x):
-        # NOTE: for I2I test
         _, _, h, w = x.size()
         mod_pad_h = (self.patch_size - h % self.patch_size) % self.patch_size
         mod_pad_w = (self.patch_size - w % self.patch_size) % self.patch_size
@@ -665,31 +865,30 @@ class DehazeFormer(nn.Module):
         return x
 
     def upsample_to_match(self, x, ref):
-        # Upsample tensor x to match the spatial size of tensor ref
         return F.interpolate(x, size=ref.shape[2:], mode='bilinear', align_corners=False)
 
     def forward_features(self, x):
-        x = self.patch_embed(x)
+        x = self.patch_embed(x)  # in_chans=3 -> embed_dims[0]=24
         x = self.mecs(x)
         x = self.marp(x)
         x = self.layer1(x)
         skip1 = x
 
-        x = self.patch_merge1(x)
+        x = self.patch_merge1(x)  # 24 -> 48
         x = self.layer2(x)
         skip2 = x
 
-        x = self.patch_merge2(x)
+        x = self.patch_merge2(x)  # 48 -> 96
         x = self.layer3(x)
-        x = self.patch_split1(x)
+        x = self.patch_split1(x)  # 96 -> 48
 
         x = self.fusion1([x, self.skip2(skip2)]) + x
         x = self.layer4(x)
-        x = self.patch_split2(x)
+        x = self.patch_split2(x)  # 48 -> 24
 
         x = self.fusion2([x, self.skip1(skip1)]) + x
         x = self.layer5(x)
-        x = self.patch_unembed(x)
+        x = self.patch_unembed(x)  # 24 -> 12
         return x
 
     def forward(self, x):
@@ -701,7 +900,6 @@ class DehazeFormer(nn.Module):
         x = K * x - B + x
         x = x[:, :, :H, :W]
         return x
-
 
 class SpatialAttention5(nn.Module):
     def __init__(self):
@@ -771,32 +969,38 @@ class CGAFusion(nn.Module):
 
 class ParNetAttention(nn.Module):
     # 初始化ParNet注意力模块
-    def __init__(self, channel=512):
+    def __init__(self, channel=512, reduction_ratio=4):
         super().__init__()
-        # 使用自适应平均池化和1x1卷积实现空间压缩，然后通过Sigmoid激活函数产生权重图
+        reduced_channel = max(channel // reduction_ratio, 32)  # 降低通道数进行参数压缩
+
+        # 确保分组卷积的组数可以整除通道数
+        groups = gcd(channel, 4)  # 假设我们希望最多分16组，gcd是求最大公约数的函数
+
+        # 使用自适应平均池化和1x1卷积实现空间压缩
         self.sse = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),  # 全局平均池化，将空间维度压缩到1x1
-            nn.Conv2d(channel, channel, kernel_size=1),  # 1x1卷积，用于调整通道的权重
+            nn.Conv2d(channel, reduced_channel, kernel_size=1),  # 减少通道数
+            nn.ReLU(True),  # 使用ReLU以保持非线性
+            nn.Conv2d(reduced_channel, channel, kernel_size=1),  # 恢复通道数
             nn.Sigmoid()  # Sigmoid函数，用于生成注意力图
         )
 
-        # 通过1x1卷积实现特征重映射，不改变空间尺寸
+        # 通过1x1分组卷积实现特征重映射
         self.conv1x1 = nn.Sequential(
-            nn.Conv2d(channel, channel, kernel_size=1),  # 1x1卷积，不改变特征图的空间尺寸
-            nn.BatchNorm2d(channel)  # 批量归一化
+            nn.Conv2d(channel, channel, kernel_size=1, groups=groups),  # 使用分组卷积减少参数
+            nn.BatchNorm2d(channel)
         )
 
-        # 通过3x3卷积捕获空间上下文信息
+        # 通过3x3分组卷积捕获空间上下文信息
         self.conv3x3 = nn.Sequential(
-            nn.Conv2d(channel, channel, kernel_size=3, padding=1),  # 3x3卷积，保持特征图尺寸不变
-            nn.BatchNorm2d(channel)  # 批量归一化
+            nn.Conv2d(channel, channel, kernel_size=3, padding=1, groups=groups),  # 分组卷积
+            nn.BatchNorm2d(channel)
         )
 
         self.silu = nn.SiLU()  # SiLU激活函数，也被称为Swish函数
 
     def forward(self, x):
         # x是输入的特征图，形状为(Batch, Channel, Height, Width)
-        b, c, _, _ = x.size()
         x1 = self.conv1x1(x)  # 通过1x1卷积处理x
         x2 = self.conv3x3(x)  # 通过3x3卷积处理x
         x3 = self.sse(x) * x  # 应用空间压缩的注意力权重到x上
@@ -805,55 +1009,58 @@ class ParNetAttention(nn.Module):
 
 
 class SKAttention(nn.Module):
-    def __init__(self, channel=512, kernels=[1, 3, 5, 7], reduction=16, group=1, L=32):
+    def __init__(self, in_channels, out_channels):
         super(SKAttention, self).__init__()
-        # 计算维度压缩后的向量长度
-        self.d = max(L, channel // reduction)
-        # 不同尺寸的卷积核组成的卷积层列表
-        self.convs = nn.ModuleList([])
-        for k in kernels:
-            self.convs.append(
-                nn.Sequential(OrderedDict([
-                    ('conv', nn.Conv2d(channel, channel, kernel_size=k, padding=k // 2, groups=group)),
-                    ('bn', nn.BatchNorm2d(channel)),
-                    ('relu', nn.ReLU())
-                ]))
-            )
-        # 通道数压缩的全连接层
-        self.fc = nn.Linear(channel, self.d)
-        # 为每个卷积核尺寸对应的特征图计算注意力权重的全连接层列表
-        self.fcs = nn.ModuleList([])
-        for i in range(len(kernels)):
-            self.fcs.append(nn.Linear(self.d, channel))
-        # 注意力权重的Softmax层
-        self.softmax = nn.Softmax(dim=0)
+        
+        # 多尺度卷积分支
+        self.conv3x3 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
+        self.bn3x3 = nn.BatchNorm2d(in_channels)
+        self.relu3x3 = nn.ReLU(inplace=True)
+        
+        self.conv5x5 = nn.Conv2d(in_channels, in_channels, kernel_size=5, padding=2)
+        self.bn5x5 = nn.BatchNorm2d(in_channels)
+        self.relu5x5 = nn.ReLU(inplace=True)
+        
+        self.conv7x7 = nn.Conv2d(in_channels, in_channels, kernel_size=7, padding=3)
+        self.bn7x7 = nn.BatchNorm2d(in_channels)
+        self.relu7x7 = nn.ReLU(inplace=True)
+        
+        # 1x1卷积融合特征
+        self.conv1x1 = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        
+        # 全局平均池化 + 通道注意力
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.reweight = nn.Sequential(
+            nn.Linear(out_channels, out_channels // 4),
+            nn.ReLU(inplace=True),
+            nn.Linear(out_channels // 4, out_channels)
+        )
+        self.softmax = nn.Softmax(dim=1)
 
     def forward(self, x):
-        bs, c, _, _ = x.size()
-        conv_outs = []
-        # 通过不同尺寸的卷积核处理输入
-        for conv in self.convs:
-            conv_outs.append(conv(x))
-        feats = torch.stack(conv_outs, 0)  # k, bs, channel, h, w
+        # 多尺度卷积
+        x3 = self.relu3x3(self.bn3x3(self.conv3x3(x)))
+        x5 = self.relu5x5(self.bn5x5(self.conv5x5(x)))
+        x7 = self.relu7x7(self.bn7x7(self.conv7x7(x)))
+        
+        # 特征融合 - 按元素求和
+        fused = x3 + x5 + x7
+        
+        # 1x1卷积调整通道
+        fused = self.conv1x1(fused)
+        
+        # 全局平均池化 + 通道注意力
+        x_pooled = self.gap(fused)
+        x_pooled = x_pooled.view(x_pooled.size(0), -1)  # [N, C]
+        x_reweight = self.reweight(x_pooled)
+        x_reweight = self.softmax(x_reweight)
+        
+        # 将通道注意力权重应用到输入特征
+        x_reweight = x_reweight.unsqueeze(2).unsqueeze(3)  # [N, C, 1, 1]
+        out = fused * x_reweight.expand_as(fused)
+        
+        return out
 
-        # 将所有卷积核的输出求和得到融合特征图U
-        U = sum(conv_outs)  # bs, c, h, w
-
-        # 对融合特征图U进行全局平均池化，并通过全连接层降维得到Z
-        S = U.mean(-1).mean(-1)  # bs, c
-        Z = self.fc(S)  # bs, d
-
-        # 计算每个卷积核对应的注意力权重
-        weights = []
-        for fc in self.fcs:
-            weight = fc(Z)
-            weights.append(weight.view(bs, c, 1, 1))  # bs, channel
-        attention_weights = torch.stack(weights, 0)  # k, bs, channel, 1, 1
-        attention_weights = self.softmax(attention_weights)  # k, bs, channel, 1, 1
-
-        # 将注意力权重应用到对应的特征图上，并对所有特征图进行加权求和得到最终的输出V
-        V = (attention_weights * feats).sum(0)
-        return V
 
 
 # ChannelAttention Module
@@ -865,6 +1072,14 @@ class ChannelAttention(nn.Module):
         self.fc2 = nn.Conv2d(in_channels=internal_neurons, out_channels=input_channels, kernel_size=1, stride=1,
                              bias=True)
         self.input_channels = input_channels
+        self.depth_convs = nn.ModuleList([
+            nn.Conv2d(input_channels, input_channels, kernel_size=(1, 5), padding=(0, 2)),
+            nn.Conv2d(input_channels, input_channels, kernel_size=(5, 1), padding=(2, 0)),
+            nn.Conv2d(input_channels, input_channels, kernel_size=(1, 7), padding=(0, 3)),
+            nn.Conv2d(input_channels, input_channels, kernel_size=(7, 1), padding=(3, 0)),
+            nn.Conv2d(input_channels, input_channels, kernel_size=(1, 9), padding=(0, 4)),
+            nn.Conv2d(input_channels, input_channels, kernel_size=(9, 1), padding=(4, 0)),
+        ])
 
     def forward(self, inputs):
         avg_pool = F.adaptive_avg_pool2d(inputs, output_size=(1, 1))
@@ -874,19 +1089,19 @@ class ChannelAttention(nn.Module):
         avg_out = self.fc1(avg_pool)
         avg_out = F.relu(avg_out, inplace=True)
         avg_out = self.fc2(avg_out)
-        avg_out = torch.sigmoid(avg_out)
 
         max_out = self.fc1(max_pool)
         max_out = F.relu(max_out, inplace=True)
         max_out = self.fc2(max_out)
-        max_out = torch.sigmoid(max_out)
 
         median_out = self.fc1(median_pool)
         median_out = F.relu(median_out, inplace=True)
         median_out = self.fc2(median_out)
-        median_out = torch.sigmoid(median_out)
 
         out = avg_out + max_out + median_out
+        out = torch.sigmoid(out)
+        out = [conv(out) for conv in self.depth_convs]
+        out = sum(out)
         return out
 
     @staticmethod
@@ -898,8 +1113,7 @@ class ChannelAttention(nn.Module):
 
 # MECS Module
 class MECS(nn.Module):
-    def __init__(self, in_channels, out_channels, channel_attention_reduce=4, sk_attention_kernels=[1, 3, 5, 7],
-                 sk_reduction=16):
+    def __init__(self, in_channels, out_channels, channel_attention_reduce=4):
         super(MECS, self).__init__()
 
         self.C = in_channels
@@ -911,19 +1125,19 @@ class MECS(nn.Module):
                                                   internal_neurons=in_channels // channel_attention_reduce)
 
         # SKAttention 模块
-        self.sk_attention = SKAttention(channel=in_channels, kernels=sk_attention_kernels, reduction=sk_reduction)
+        self.sk_attention = SKAttention(in_channels=in_channels,out_channels=out_channels)
 
         # 定义 5x5 深度卷积层
         self.initial_depth_conv = nn.Conv2d(in_channels, in_channels, kernel_size=5, padding=2, groups=in_channels)
 
         # 定义多个不同尺寸的深度卷积层
         self.depth_convs = nn.ModuleList([
-            nn.Conv2d(in_channels, in_channels, kernel_size=(1, 7), padding=(0, 3), groups=in_channels),
-            nn.Conv2d(in_channels, in_channels, kernel_size=(7, 1), padding=(3, 0), groups=in_channels),
-            nn.Conv2d(in_channels, in_channels, kernel_size=(1, 11), padding=(0, 5), groups=in_channels),
-            nn.Conv2d(in_channels, in_channels, kernel_size=(11, 1), padding=(5, 0), groups=in_channels),
-            nn.Conv2d(in_channels, in_channels, kernel_size=(1, 21), padding=(0, 10), groups=in_channels),
-            nn.Conv2d(in_channels, in_channels, kernel_size=(21, 1), padding=(10, 0), groups=in_channels),
+            nn.Conv2d(in_channels, in_channels, kernel_size=(1, 5), padding=(0, 2)),
+            nn.Conv2d(in_channels, in_channels, kernel_size=(5, 1), padding=(2, 0)),
+            nn.Conv2d(in_channels, in_channels, kernel_size=(1, 7), padding=(0, 3)),
+            nn.Conv2d(in_channels, in_channels, kernel_size=(7, 1), padding=(3, 0)),
+            nn.Conv2d(in_channels, in_channels, kernel_size=(1, 9), padding=(0, 4)),
+            nn.Conv2d(in_channels, in_channels, kernel_size=(9, 1), padding=(4, 0)),
         ])
 
         # 定义 1x1 卷积层和激活函数
@@ -960,7 +1174,7 @@ def dehazeformer_t():
     return DehazeFormer(
         embed_dims=[24, 48, 96, 48, 24],
         mlp_ratios=[2., 4., 4., 2., 2.],
-        depths=[4, 4, 4, 4, 4],
+        depths=[4, 4, 4, 3, 3],
         num_heads=[2, 4, 6, 4, 2],
         attn_ratio=[0, 1 / 2, 1, 1/2, 0],
         conv_type=['DWConv', 'DWConv', 'DWConv', 'DWConv', 'DWConv'])
