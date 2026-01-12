@@ -1,0 +1,12 @@
+fastapi==0.111.0
+uvicorn[standard]==0.30.0
+pillow==10.4.0
+numpy==2.0.1
+# Optional but recommended
+opencv-python-headless==4.10.0.84
+# metrics
+scikit-image==0.24.0
+# PyTorch: install matching CUDA locally or in image; left unpinned to choose by platform
+# torch
+# torchvision
+
